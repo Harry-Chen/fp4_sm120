@@ -1,145 +1,60 @@
-# FP4 E2M1 Stochastic Rounding Polyfill for SM120 Family
+# NVFP4 Support for SM120 Family
 
-Kernel polyfill for `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding` on devices
-that lack the `cvt.rs.satfinite.e2m1x4.f32` PTX instruction — primarily the
-NVIDIA RTX 50x0 series (Blackwell, SM120) and DGX Spark (SM121).
+Patches and kernels to enable Transformer Engine's NVFP4 (FP4 E2M1) training
+on NVIDIA SM120 family GPUs (RTX 50x0, DGX Spark), where several SM100-era
+PTX instructions are missing or changed.
 
 ## Background
 
-SM120 family removed the single-instruction stochastic-rounding FP4 conversion
-(`cvt.rs.satfinite.e2m1x4.f32`) that was available on SM100. The existing
-instruction `cvt.rn.satfinite.e2m1x2.f32` only supports **round-to-nearest** and
-packs **2** E2M1 values at a time instead of 4.
+Transformer Engine uses FP4 E2M1 quantization for forward-pass activations and
+weights in FP4 training recipes. The kernels rely on SM100-specific PTX
+instructions that are not all available on the SM120 family:
 
-This repo contains two independent polyfill implementations — one targeting
-SM120 hardware, one pure software — that restore stochastic rounding semantics
-on top of the available hardware.
+| Instruction | SM100 | SM120 | Status |
+|-------------|-------|-------|--------|
+| `cvt.rs.satfinite.e2m1x4.f32` | Yes | **No** | Polyfilled in `stochastic_rounding/` |
+| `cvt.rn.satfinite.e2m1x2.f32` | Yes | Yes | Used by polyfill |
+| RHT GEMM (Random Hadamard Transform) | SM100 kernel | Needs porting | Planned in `rht_gemm/` |
 
-## File Structure
+## Components
 
-```
-sr.sm120.cuh        # Drop-in header: hardware RN + software SR noise (SM120)
-sr.sm120.cu         # Tests and benchmarks for the SM120 implementation
-sr.software.cuh     # Drop-in header: pure software quantization
-sr.software.cu      # Tests and benchmarks for the software implementation
-compare.cuh         # Native + both polyfills side-by-side (for SM100 comparison)
-compare.cu          # Comparison tests: native vs polyfill on B300
-```
+### [`stochastic_rounding/`](stochastic_rounding/) — Done
 
-The `.cuh` headers are self-contained drop-in replacements with minimal
-dependencies — just include one and call the desired function.
+Drop-in polyfills for the stochastic rounding FP4 conversion functions removed
+in SM120. Two implementations:
 
-## Polyfilled Functions
+- **`sr.sm120.cuh`** — Uses `cvt.rn.satfinite.e2m1x2.f32` + software SR noise
+  injection. Requires SM120 family hardware.
+- **`sr.software.cuh`** — Pure software quantization. Works on any CUDA
+  architecture.
 
-| Function | Inputs | Description |
-|----------|--------|-------------|
-| `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding` | 4x BF16 + float2 scale + rbits | BF16 multiply-and-quantize to FP4 with SR |
-| `mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding` | 2x float2 + float2 scale + rbits | FP32 multiply-and-quantize to FP4 with SR |
-| `cvt_fp32_to_fp4_4x_with_stochastic_rounding` | 2x float2 + rbits | FP32 quantize to FP4 with SR (no scale) |
-| `mul_cvt_bf16_to_fp4_8x_stochastic_rounding` | 8x BF16 + scalar scale + 2x rbits | 8-wide BF16 multiply-and-quantize to FP4 with SR |
+Polyfilled functions:
+- `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding`
+- `mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding`
+- `cvt_fp32_to_fp4_4x_with_stochastic_rounding`
+- `mul_cvt_bf16_to_fp4_8x_stochastic_rounding`
 
-## Implementations
+Validated against native SM100 hardware (`compare.cu` on B300) — bit-exact
+match for the SM120 polyfill, statistical equivalence for the software polyfill.
 
-### `sr.sm120.cuh` — Hardware RN + Software SR Noise
+See [`stochastic_rounding/README.md`](stochastic_rounding/README.md) for details.
 
-Applies software stochastic rounding noise *before* the hardware round-to-nearest
-conversion, so the deterministic RN instruction produces stochastic rounding
-behavior:
+### [`rht_gemm/`](rht_gemm/) — Planned
 
-1. Convert BF16 to FP32 and multiply by scale
-2. For each value, inject symmetric noise in [-ULP/2, ULP/2) clamped to the ULP
-   floor (`apply_sr_noise_e2m1`), so `P(round_up) = (|x| - |x_lo|) / ULP`
-3. Pack with two `cvt.rn.satfinite.e2m1x2.f32` calls, combined into a 16-bit result
-
-Requires `cvt.rn.satfinite.e2m1x2.f32` — builds on `sm_120f, sm_120a, sm_121a`.
-
-### `sr.software.cuh` — Pure Software Quantization (with optional hardware path)
-
-Performs the full quantization in software using explicit bracket lookup and
-threshold comparison:
-
-1. Convert BF16 to FP32, multiply by scale
-2. Find the E2M1 floor/ceil bracket for each value
-3. Compute `p_up = (|x| - floor) / (ceil - floor)`, convert to a 32-bit threshold
-4. Compare against per-lane random bits to decide round-up vs round-down
-5. Pack four 4-bit nibbles into a 16-bit result
-
-Also includes a gated hardware path (`ARCH_HAS_STOCHASTIC_ROUNDING=1`) using
-the original `cvt.rs.satfinite.e2m1x4.f32` for architectures that support it.
-
-Pure software — can be built on any CUDA architecture.
-
-## E2M1 Format
-
-4-bit floating point with 1 sign bit, 2 exponent bits, 1 mantissa bit.
-Representable values: {0, 0.5, 1, 1.5, 2, 3, 4, 6} (and their negatives).
+Random Hadamard Transform GEMM kernel for SM120. Required by Transformer
+Engine's FP4 recipe to apply the Hadamard rotation before quantization.
 
 ## Building
 
-Requires CUDA toolkit with SM120 support (CUDA 12.8+).
+Each component has its own Makefile. See the README in each subdirectory.
 
 ```bash
-make            # builds sr.sm120.exe and sr.software.exe
-make clean      # removes executables
+# Build stochastic rounding tests (SM120)
+cd stochastic_rounding && make
+
+# Build comparison test (requires SM100 hardware)
+cd stochastic_rounding && make compare.exe CUDA_ARCH=100a
 ```
-
-Set `CUDA_ARCH` for a different CUDA architecture, and `CUDA_HOME` if
-your CUDA installation is not at `/usr/local/cuda`:
-
-```bash
-make CUDA_HOME=/path/to/cuda CUDA_ARCH=121a
-```
-
-### Comparison test (requires SM100 hardware, e.g. B300)
-
-```bash
-make compare.exe CUDA_ARCH=100a
-./compare.exe
-```
-
-This builds the native `cvt.rs.satfinite.e2m1x4.f32` implementation alongside
-both polyfills, runs them on the same random inputs, and reports:
-- Bit-exact match rate (SM120 polyfill vs native)
-- Per-nibble mean comparison (all three implementations)
-- Per-value unbiasedness: E[SR(x)] vs x for native, SM120, and software
-
-## Test Suites
-
-### SM120 (`sr.sm120.exe`)
-
-| Test | Description |
-|------|-------------|
-| Test 0 | Bare `cvt_e2m1x4_rn` sanity check — verifies nibble packing order |
-| Test 1 | SR probability — measured vs expected round-up probability for 16 test values |
-| Test 2 | Unbiasedness — verifies `E[SR(x)] ~ x` over 2.56M trials per value |
-| Test 3 | Exact representable values — SR of exact E2M1 values always returns itself |
-| Test 4 | Saturation — values beyond \|6.0\| clamp to +/-6.0 |
-| Test 5 | All 4 lanes — valid output and correct sign across all nibble positions |
-| Test 7 | E2E `mul_cvt_bf16_to_fp4_4x` — exact values, scale semantics, saturation, unbiasedness |
-| Test 8 | E2E `mul_cvt_fp32_to_fp4_4x` — exact values, scale semantics, unbiasedness |
-| Test 9 | E2E `mul_cvt_bf16_to_fp4_8x` — exact values, scalar scale, unbiasedness across 8 lanes |
-| Test 6 | Throughput benchmark — SR kernel vs read-only baseline at 4/64/256 MB |
-
-### Software (`sr.software.exe`)
-
-| Test | Description |
-|------|-------------|
-| Fixed examples | Spot-check specific input/scale/rbits combinations |
-| Exact representables | All 15 exact E2M1 values round-trip correctly |
-| Saturation / specials | Overflow, infinity, and NaN clamp to +/-6.0 |
-| Scale semantics | Verifies even/odd lane scale factors (`scale.x` / `scale.y`) |
-| CPU/GPU consistency | 20,000 random cases for BF16-4x, FP32-4x, and BF16-8x vs CPU reference |
-| Probability suites | Round-up probability across 7 RNG streams at midpoint and non-midpoint |
-| Throughput benchmark | Quantize kernel vs stream baseline with effective bandwidth reporting |
-
-### Comparison (`compare.exe`, SM100 only)
-
-| Test | Description |
-|------|-------------|
-| Test 1 | `mul_cvt_bf16_to_fp4_4x` — bit-exact match + mean: native vs SM120 vs software |
-| Test 2 | `cvt_fp32_to_fp4_4x` — bit-exact match + mean: native vs SM120 vs software |
-| Test 3 | Per-value unbiasedness for `mul_cvt_bf16_to_fp4_4x` (16 test values, ~1M trials each) |
-| Test 4 | Per-value unbiasedness for `cvt_fp32_to_fp4_4x` (16 test values, ~1M trials each) |
 
 ## License
 
