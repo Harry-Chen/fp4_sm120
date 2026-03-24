@@ -15,9 +15,21 @@ This repo contains two independent polyfill implementations — one generated wi
 Claude, one with ChatGPT — that restore stochastic rounding semantics on top of
 the available hardware.
 
+## File Structure
+
+```
+cvt.claude.cuh      # Drop-in header: hardware RN + software SR noise
+cvt.claude.cu       # Tests and benchmarks for the Claude implementation
+cvt.chatgpt.cuh     # Drop-in header: pure software quantization
+cvt.chatgpt.cu      # Tests and benchmarks for the ChatGPT implementation
+```
+
+The `.cuh` headers are self-contained drop-in replacements with minimal
+dependencies — just include one and call `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding()`.
+
 ## Implementations
 
-### `cvt.claude.cu` — Hardware RN + Software SR Noise
+### `cvt.claude.cuh` — Hardware RN + Software SR Noise
 
 Applies software stochastic rounding noise *before* the hardware round-to-nearest
 conversion, so the deterministic RN instruction produces stochastic rounding
@@ -28,7 +40,7 @@ behavior:
    floor (`apply_sr_noise_e2m1`), so `P(round_up) = (|x| - |x_lo|) / ULP`
 3. Pack with two `cvt.rn.satfinite.e2m1x2.f32` calls, combined into a 16-bit result
 
-### `cvt.chatgpt.cu` — Pure Software Quantization (with optional hardware path)
+### `cvt.chatgpt.cuh` — Pure Software Quantization (with optional hardware path)
 
 Performs the full quantization in software using explicit bracket lookup and
 threshold comparison:

@@ -7,11 +7,14 @@ EXE := $(SRC:%.cu=%.exe)
 
 all: $(EXE)
 
+# Header dependencies
+cvt.claude.exe: cvt.claude.cu cvt.claude.cuh
+cvt.chatgpt.exe: cvt.chatgpt.cu cvt.chatgpt.cuh
+
 %.exe: %.cu
-	$(NVCC) $(NVCC_FLAGS) $^ -o $@
+	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
 .PHONY: all clean
 
 clean:
 	rm -rf *.exe
-

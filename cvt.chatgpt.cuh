@@ -1,0 +1,173 @@
+#pragma once
+
+#include <stdint.h>
+#include <math.h>
+#include <string.h>
+
+#ifndef ARCH_HAS_STOCHASTIC_ROUNDING
+#define ARCH_HAS_STOCHASTIC_ROUNDING 0
+#endif
+
+struct fp4e2m1x4 {
+  uint16_t storage;
+};
+
+static inline __host__ __device__ fp4e2m1x4 make_fp4e2m1x4(uint16_t x) {
+  fp4e2m1x4 out;
+  out.storage = x;
+  return out;
+}
+
+static inline __host__ __device__ uint16_t raw_bits(fp4e2m1x4 x) {
+  return x.storage;
+}
+
+static inline __host__ __device__ float fp4_e2m1_code_to_abs_float(uint8_t mag_code) {
+  switch (mag_code & 0x7) {
+    case 0: return 0.0f;
+    case 1: return 0.5f;
+    case 2: return 1.0f;
+    case 3: return 1.5f;
+    case 4: return 2.0f;
+    case 5: return 3.0f;
+    case 6: return 4.0f;
+    default: return 6.0f;
+  }
+}
+
+static inline __host__ __device__ uint8_t pack_fp4_e2m1(bool neg, uint8_t mag_code) {
+  return static_cast<uint8_t>((neg ? 0x8 : 0x0) | (mag_code & 0x7));
+}
+
+static inline __host__ __device__ float bf16_bits_to_float(uint16_t x) {
+  uint32_t u = static_cast<uint32_t>(x) << 16;
+  float f;
+#if defined(__CUDA_ARCH__)
+  f = __uint_as_float(u);
+#else
+  memcpy(&f, &u, sizeof(f));
+#endif
+  return f;
+}
+
+static inline __host__ __device__ uint16_t get_bf16_lane(uint64_t packed, int lane) {
+  return static_cast<uint16_t>((packed >> (16 * lane)) & 0xFFFFu);
+}
+
+static inline __host__ __device__ uint32_t mix_lane_bits(uint32_t rbits, int lane) {
+  uint32_t x = rbits ^ (0x9E3779B9u * static_cast<uint32_t>(lane + 1));
+  x ^= x >> 16;
+  x *= 0x7FEB352Du;
+  x ^= x >> 15;
+  x *= 0x846CA68Bu;
+  x ^= x >> 16;
+  return x;
+}
+
+static inline __host__ __device__ float decode_one_fp4_e2m1(uint8_t nibble) {
+  const bool neg = (nibble & 0x8) != 0;
+  const float v = fp4_e2m1_code_to_abs_float(nibble & 0x7);
+  return neg ? -v : v;
+}
+
+static inline __host__ __device__ uint16_t pack_4_fp4_nibbles(uint8_t x0, uint8_t x1,
+                                                               uint8_t x2, uint8_t x3) {
+  return static_cast<uint16_t>((x0 & 0xF) |
+                               ((x1 & 0xF) << 4) |
+                               ((x2 & 0xF) << 8) |
+                               ((x3 & 0xF) << 12));
+}
+
+static inline __host__ __device__ uint64_t prob_to_threshold_u32(float p_up) {
+  if (!(p_up > 0.0f)) return 0ull;
+  if (p_up >= 1.0f) return (1ull << 32);
+  const double scaled = static_cast<double>(p_up) * 4294967296.0;
+  uint64_t thr = static_cast<uint64_t>(scaled);
+  if (thr > (1ull << 32)) thr = (1ull << 32);
+  return thr;
+}
+
+static inline __host__ __device__ uint8_t quantize_fp32_to_fp4_e2m1_sr(float x, uint32_t rnd) {
+  if (!isfinite(x)) {
+    return pack_fp4_e2m1(signbit(x), 7);
+  }
+
+  const bool neg = signbit(x);
+  const float ax = fabsf(x);
+
+  if (ax >= 6.0f) {
+    return pack_fp4_e2m1(neg, 7);
+  }
+
+  constexpr float kVals[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+  for (uint8_t i = 0; i < 8; ++i) {
+    if (ax == kVals[i]) {
+      return pack_fp4_e2m1(neg, i);
+    }
+  }
+
+  uint8_t hi = 1;
+  while (hi < 8 && !(ax < kVals[hi])) {
+    ++hi;
+  }
+  const uint8_t lo = static_cast<uint8_t>(hi - 1);
+
+  const float vlo = kVals[lo];
+  const float vhi = kVals[hi];
+  const float p_up = (ax - vlo) / (vhi - vlo);
+
+  const uint64_t threshold = prob_to_threshold_u32(p_up);
+  const uint8_t chosen = (static_cast<uint64_t>(rnd) < threshold) ? hi : lo;
+  return pack_fp4_e2m1(neg, chosen);
+}
+
+__device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
+    const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
+  uint16_t out_4x = 0;
+
+  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
+  if constexpr (has_rs) {
+    asm volatile(
+        "{\n"
+        ".reg.b64 v01; \n\t"
+        ".reg.b64 v23; \n\t"
+        ".reg.b16 v0_bf16; \n\t"
+        ".reg.b16 v1_bf16; \n\t"
+        ".reg.b16 v2_bf16; \n\t"
+        ".reg.b16 v3_bf16; \n\t"
+        ".reg.b32 v0; \n\t"
+        ".reg.b32 v1; \n\t"
+        ".reg.b32 v2; \n\t"
+        ".reg.b32 v3; \n\t"
+        "mov.b64 {v0_bf16, v1_bf16, v2_bf16, v3_bf16}, %1; \n\t"
+        "cvt.f32.bf16 v0, v0_bf16; \n\t"
+        "cvt.f32.bf16 v1, v1_bf16; \n\t"
+        "cvt.f32.bf16 v2, v2_bf16; \n\t"
+        "cvt.f32.bf16 v3, v3_bf16; \n\t"
+        "mov.b64 v01, {v0, v1}; \n\t"
+        "mov.b64 v23, {v2, v3}; \n\t"
+        "mul.f32x2 v01, v01, %2; \n\t"
+        "mul.f32x2 v23, v23, %2; \n\t"
+        "mov.b64 {v1, v0}, v01; \n\t"
+        "mov.b64 {v3, v2}, v23; \n\t"
+        "cvt.rs.satfinite.e2m1x4.f32 %0, {v2, v3, v0, v1}, %3; \n\t"
+        "}"
+        : "=h"(out_4x)
+        : "l"(in_4x), "l"(reinterpret_cast<const uint64_t &>(scale)), "r"(rbits));
+  } else {
+    const float v0 = bf16_bits_to_float(get_bf16_lane(in_4x, 0)) * scale.x;
+    const float v1 = bf16_bits_to_float(get_bf16_lane(in_4x, 1)) * scale.y;
+    const float v2 = bf16_bits_to_float(get_bf16_lane(in_4x, 2)) * scale.x;
+    const float v3 = bf16_bits_to_float(get_bf16_lane(in_4x, 3)) * scale.y;
+
+    const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits, 0));
+    const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits, 1));
+    const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits, 2));
+    const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits, 3));
+
+    out_4x = pack_4_fp4_nibbles(q0, q1, q2, q3);
+  }
+
+  return make_fp4e2m1x4(out_4x);
+}
