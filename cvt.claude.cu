@@ -380,13 +380,11 @@ __global__ void bench_fp32_to_e2m1x4_sr(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_groups) return;
 
-    float a = input[4 * idx + 0];
-    float b = input[4 * idx + 1];
-    float c = input[4 * idx + 2];
-    float d = input[4 * idx + 3];
+    // Coalesced 128-bit load: adjacent threads read consecutive float4s
+    float4 v = reinterpret_cast<const float4 *>(input)[idx];
     unsigned rbits = bench_hash(seed, idx);
 
-    output[idx] = fp32x4_to_e2m1x4_sr(a, b, c, d, rbits);
+    output[idx] = fp32x4_to_e2m1x4_sr(v.x, v.y, v.z, v.w, rbits);
 }
 
 // Reduction kernel: compute checksum to prevent dead-code elimination of stores
@@ -412,11 +410,11 @@ __global__ void bench_readonly_baseline(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_groups) return;
 
-    // Read 4 floats, pack into 2 bytes (trivial — just truncate)
-    unsigned a = __float_as_uint(input[4 * idx + 0]);
-    unsigned b = __float_as_uint(input[4 * idx + 1]);
-    unsigned c = __float_as_uint(input[4 * idx + 2]);
-    unsigned d = __float_as_uint(input[4 * idx + 3]);
+    float4 v = reinterpret_cast<const float4 *>(input)[idx];
+    unsigned a = __float_as_uint(v.x);
+    unsigned b = __float_as_uint(v.y);
+    unsigned c = __float_as_uint(v.z);
+    unsigned d = __float_as_uint(v.w);
     output[idx] = (unsigned short)((a ^ b ^ c ^ d) & 0xFFFFu);
 }
 
