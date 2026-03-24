@@ -27,17 +27,17 @@ namespace rht_gemm_sm120 {
 // ============================================================
 static constexpr int TILE_M = 128;
 static constexpr int TILE_N = 16;
+static constexpr int GROUPS_PER_BLOCK = 4;
+static constexpr int TILE_N_BLOCK = TILE_N * GROUPS_PER_BLOCK;  // 64
 static constexpr int WARPS_PER_BLOCK = 8;
 static constexpr int WARP_SIZE = 32;
 static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
 
-// NVFP4 quantization constants
 static constexpr float FP4_MAX = 6.0f;
 static constexpr float FP8_E4M3_MAX = 448.0f;
 
 // ============================================================
 // FP8 UE4M3 conversion helpers (unsigned E4M3, range [0, 448])
-// Uses cvt.rn.satfinite.e4m3x2.f32 PTX instruction.
 // ============================================================
 
 __device__ __forceinline__
@@ -59,8 +59,7 @@ float ue4m3_to_float(uint8_t val) {
 
 // ============================================================
 // FP4 E2M1 conversion (round-to-nearest)
-// Packs 4 FP32 values into 16-bit (4 nibbles).
-// Layout: bits[3:0]=d, [7:4]=c, [11:8]=b, [15:12]=a
+// bits[3:0]=d, [7:4]=c, [11:8]=b, [15:12]=a
 // ============================================================
 
 __device__ __forceinline__
@@ -86,8 +85,6 @@ uint16_t cvt_e2m1x4_rn(float a, float b, float c, float d) {
 
 // ============================================================
 // Stochastic rounding noise injection for E2M1
-// From sr.sm120.cuh: adds noise in [-ULP/2, ULP/2) then clamps,
-// so that hardware RN yields correct SR probability.
 // ============================================================
 
 __device__ __forceinline__
@@ -95,17 +92,14 @@ float apply_sr_noise_e2m1(float x, unsigned rand_byte) {
     unsigned u = __float_as_uint(x);
     unsigned abs_u = u & 0x7FFFFFFFu;
     unsigned exp = abs_u >> 23;
-
     unsigned ulp_bexp = min(max(exp, 127u), 129u) - 1u;
     float ulp = __uint_as_float(ulp_bexp << 23);
-
     float x_lo_abs;
     if (exp >= 127u) {
         x_lo_abs = __uint_as_float(abs_u & 0xFFC00000u);
     } else {
         x_lo_abs = (exp >= 126u) ? 0.5f : 0.0f;
     }
-
     float noise = (float)((int)rand_byte - 127.5f) * __uint_as_float(0x3B800000u) * ulp;
     float ax_noisy = fmaxf(fabsf(x) + noise, x_lo_abs);
     return copysignf(ax_noisy, x);
@@ -121,7 +115,7 @@ uint16_t cvt_e2m1x4_sr(float a, float b, float c, float d, uint32_t rbits) {
 }
 
 // ============================================================
-// Philox4x32-10 RNG (compatible with Transformer Engine)
+// Philox4x32-10 RNG
 // ============================================================
 
 struct Philox4x32 {
@@ -153,14 +147,10 @@ struct Philox4x32 {
     __device__ static void round(uint32_t* c, const uint32_t* k) {
         uint64_t r0 = static_cast<uint64_t>(0xD2511F53u) * c[0];
         uint64_t r1 = static_cast<uint64_t>(0xCD9E8D57u) * c[2];
-        uint32_t hi0 = static_cast<uint32_t>(r0 >> 32);
-        uint32_t lo0 = static_cast<uint32_t>(r0);
-        uint32_t hi1 = static_cast<uint32_t>(r1 >> 32);
-        uint32_t lo1 = static_cast<uint32_t>(r1);
-        c[0] = hi1 ^ c[1] ^ k[0];
-        c[1] = lo1;
-        c[2] = hi0 ^ c[3] ^ k[1];
-        c[3] = lo0;
+        c[0] = static_cast<uint32_t>(r1 >> 32) ^ c[1] ^ k[0];
+        c[1] = static_cast<uint32_t>(r1);
+        c[2] = static_cast<uint32_t>(r0 >> 32) ^ c[3] ^ k[1];
+        c[3] = static_cast<uint32_t>(r0);
     }
 };
 
@@ -178,12 +168,14 @@ float compute_global_encode_scale(float global_amax) {
 // ============================================================
 // Main RHT GEMM kernel
 //
-// Each block processes TILE_M (128) rows x TILE_N (16) columns.
-// 8 warps, each handles 16x16 via WMMA.
+// Each block processes TILE_M (128) rows x GROUPS_PER_BLOCK (4) x
+// TILE_N (16) columns = 128 x 64 output tile.
+// 8 warps, each handles 16x16 via WMMA per column group.
 // ============================================================
 
 template <bool kEnableStochasticRounding, bool kUseFastMath>
-__global__ void rht_gemm_kernel(
+__global__ void
+rht_gemm_kernel(
     int M, int N,
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
@@ -198,156 +190,140 @@ __global__ void rht_gemm_kernel(
     const int lane_id = threadIdx.x % WARP_SIZE;
 
     const int block_row = blockIdx.x * TILE_M;
-    const int col_group = blockIdx.y;
-    const int col_start = col_group * TILE_N;
+    const int block_col_base = blockIdx.y * TILE_N_BLOCK;
 
     // --- Shared memory layout ---
-    // smem_A: 128 x 16 BF16, col-major (4096 bytes)
-    // smem_B: 16 x 16 BF16, row-major (512 bytes)
-    // smem_C: 128 x 16 FP32, per-warp row-major (8192 bytes)
     extern __shared__ char smem_raw[];
     __nv_bfloat16* smem_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* smem_B = smem_A + TILE_M * TILE_N;
     float* smem_C = reinterpret_cast<float*>(smem_B + TILE_N * TILE_N);
 
-    // --- Load B (16x16, row-major) into shared memory ---
+    // --- Load B (16x16, row-major) once ---
     for (int i = threadIdx.x; i < TILE_N * TILE_N; i += THREADS_PER_BLOCK) {
         smem_B[i] = B[i];
     }
 
-    // --- Load A tile (128x16, col-major) into shared memory ---
-    // smem_A layout: smem_A[col * 128 + row], matching A's col-major stride
-    // Vectorized: each thread loads 8 BF16 (16 bytes) contiguously within a column
-    {
-        constexpr int ELEMS_PER_THREAD = 8;
-        constexpr int THREADS_PER_COL = TILE_M / ELEMS_PER_THREAD;  // 16
-        const int col = threadIdx.x / THREADS_PER_COL;
-        const int row_base = (threadIdx.x % THREADS_PER_COL) * ELEMS_PER_THREAD;
-
-        if (col < TILE_N) {
-            const __nv_bfloat16* src = A + (block_row + row_base) + (long long)M * (col_start + col);
-            __nv_bfloat16* dst = smem_A + col * TILE_M + row_base;
-
-            // uint4 = 16 bytes = 8 BF16, fully coalesced within each column
-            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-        }
-    }
-
-    __syncthreads();
-
-    // --- WMMA: each warp computes 16x16 Hadamard transform ---
-    const int warp_row_start = warp_id * 16;
-
-    fragment<matrix_a, 16, 16, 16, __nv_bfloat16, col_major> a_frag;
-    fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major> b_frag;
-    fragment<accumulator, 16, 16, 16, float> c_frag;
-
-    // A is col-major in smem: pointer to warp's 16 rows, leading dim = TILE_M
-    load_matrix_sync(a_frag, smem_A + warp_row_start, TILE_M);
-    load_matrix_sync(b_frag, smem_B, TILE_N);
-    fill_fragment(c_frag, 0.0f);
-    mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-    // Store WMMA result to shared memory (row-major, 16 cols per row)
-    float* warp_result = smem_C + warp_id * 16 * 16;
-    store_matrix_sync(warp_result, c_frag, 16, mem_row_major);
-
-    // No barrier needed: store_matrix_sync is warp-synchronous,
-    // and each warp only reads its own warp_result below.
-
-    // --- Quantize: FP32 → FP4 with per-16-element SFC ---
+    // Precompute quantization constants
     const float global_amax_val = *global_amax;
     const float global_encode_scale = compute_global_encode_scale(global_amax_val);
     const float global_decode_scale = 1.0f / global_encode_scale;
     const float scale_multiplier = global_encode_scale / FP4_MAX;
 
-    // Thread mapping: 2 threads per row, 16 rows per warp
-    const int row_in_tile = lane_id / 2;
-    const int half = lane_id % 2;
-    const int global_row = block_row + warp_row_start + row_in_tile;
+    // Preload B fragment (reused across all column groups)
+    __syncthreads();
+    fragment<matrix_b, 16, 16, 16, __nv_bfloat16, row_major> b_frag;
+    load_matrix_sync(b_frag, smem_B, TILE_N);
 
-    if (row_in_tile < 16 && global_row < M) {
-        // Load 8 FP32 values from this thread's half of the row
-        float vals[8];
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            vals[i] = warp_result[row_in_tile * 16 + half * 8 + i];
-        }
+    const int warp_row_start = warp_id * 16;
 
-        // BF16 round-trip for bitwise compatibility with unfused kernels
-        if constexpr (!kUseFastMath) {
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                vals[i] = __bfloat162float(__float2bfloat16(vals[i]));
+    // --- Process GROUPS_PER_BLOCK column groups ---
+    for (int g = 0; g < GROUPS_PER_BLOCK; g++) {
+        const int col_start = block_col_base + g * TILE_N;
+        if (col_start >= N) break;
+        const int col_group_idx = col_start / TILE_N;
+
+        // Load A tile (128x16, col-major) into shared memory
+        {
+            constexpr int ELEMS_PER_THREAD = 8;
+            constexpr int THREADS_PER_COL = TILE_M / ELEMS_PER_THREAD;
+            const int col = threadIdx.x / THREADS_PER_COL;
+            const int row_base = (threadIdx.x % THREADS_PER_COL) * ELEMS_PER_THREAD;
+
+            if (col < TILE_N) {
+                const __nv_bfloat16* src = A + (block_row + row_base)
+                                         + (long long)M * (col_start + col);
+                __nv_bfloat16* dst = smem_A + col * TILE_M + row_base;
+                *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
             }
         }
+        __syncthreads();
 
-        // Compute partial amax over 8 values
-        float local_max = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            local_max = fmaxf(local_max, fabsf(vals[i]));
+        // WMMA: each warp computes 16x16 Hadamard transform
+        fragment<matrix_a, 16, 16, 16, __nv_bfloat16, col_major> a_frag;
+        fragment<accumulator, 16, 16, 16, float> c_frag;
+
+        load_matrix_sync(a_frag, smem_A + warp_row_start, TILE_M);
+        fill_fragment(c_frag, 0.0f);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        // Store WMMA result to shared memory (row-major)
+        float* warp_result = smem_C + warp_id * 16 * 16;
+        store_matrix_sync(warp_result, c_frag, 16, mem_row_major);
+
+        // --- Quantize: FP32 → FP4 with per-16-element SFC ---
+        const int row_in_tile = lane_id / 2;
+        const int half = lane_id % 2;
+        const int global_row = block_row + warp_row_start + row_in_tile;
+
+        if (row_in_tile < 16 && global_row < M) {
+            float vals[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                vals[i] = warp_result[row_in_tile * 16 + half * 8 + i];
+            }
+
+            if constexpr (!kUseFastMath) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    vals[i] = __bfloat162float(__float2bfloat16(vals[i]));
+                }
+            }
+
+            float local_max = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                local_max = fmaxf(local_max, fabsf(vals[i]));
+            }
+
+            float other_max = __shfl_xor_sync(0xFFFFFFFF, local_max, 1);
+            float row_max = fmaxf(local_max, other_max);
+
+            float pvscale = row_max * scale_multiplier;
+            uint8_t pvscale_fp8 = float_to_ue4m3(pvscale);
+            float pvscale_dequant = ue4m3_to_float(pvscale_fp8);
+            float qpvscale_scaled = pvscale_dequant * global_decode_scale;
+            float acc_scale;
+            if constexpr (kUseFastMath) {
+                acc_scale = __frcp_rn(qpvscale_scaled);
+            } else {
+                acc_scale = (qpvscale_scaled != 0.0f) ? (1.0f / qpvscale_scaled) : FLT_MAX;
+            }
+            acc_scale = fminf(acc_scale, FLT_MAX);
+
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                vals[i] *= acc_scale;
+            }
+
+            // Pack to FP4 (reversed arg order for correct nibble layout)
+            uint16_t packed_lo, packed_hi;
+            if constexpr (kEnableStochasticRounding) {
+                const uint64_t rng_seed   = rng_state ? rng_state[0] : 0;
+                const uint64_t rng_offset = rng_state ? rng_state[1] : 0;
+                const uint64_t rng_seq    = threadIdx.x
+                    + (uint64_t)blockIdx.x * blockDim.x
+                    + (uint64_t)blockIdx.y * blockDim.x * gridDim.x
+                    + (uint64_t)g * blockDim.x * gridDim.x * gridDim.y;
+                Philox4x32 rng;
+                rng.init(rng_seed, rng_seq, rng_offset);
+                uint4 rand = rng.generate();
+                packed_lo = cvt_e2m1x4_sr(vals[3], vals[2], vals[1], vals[0], rand.x);
+                packed_hi = cvt_e2m1x4_sr(vals[7], vals[6], vals[5], vals[4], rand.y);
+            } else {
+                packed_lo = cvt_e2m1x4_rn(vals[3], vals[2], vals[1], vals[0]);
+                packed_hi = cvt_e2m1x4_rn(vals[7], vals[6], vals[5], vals[4]);
+            }
+            uint32_t packed = static_cast<uint32_t>(packed_lo)
+                            | (static_cast<uint32_t>(packed_hi) << 16);
+
+            int byte_offset = (global_row * N + col_start + half * 8) / 2;
+            *reinterpret_cast<uint32_t*>(C + byte_offset) = packed;
+
+            if (half == 0) {
+                SFC[global_row * (N / TILE_N) + col_group_idx] = pvscale_fp8;
+            }
         }
-
-        // Reduce amax across the 2 threads sharing this row
-        float other_max = __shfl_xor_sync(0xFFFFFFFF, local_max, 1);
-        float row_max = fmaxf(local_max, other_max);
-
-        // Per-vector scale factor (NVFP4 recipe)
-        float pvscale = row_max * scale_multiplier;
-        uint8_t pvscale_fp8 = float_to_ue4m3(pvscale);
-        float pvscale_dequant = ue4m3_to_float(pvscale_fp8);
-
-        float qpvscale_scaled = pvscale_dequant * global_decode_scale;
-        float acc_scale;
-        if constexpr (kUseFastMath) {
-            acc_scale = __frcp_rn(qpvscale_scaled);
-        } else {
-            acc_scale = (qpvscale_scaled != 0.0f) ? (1.0f / qpvscale_scaled) : FLT_MAX;
-        }
-        acc_scale = fminf(acc_scale, FLT_MAX);
-
-        // Scale values
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            vals[i] *= acc_scale;
-        }
-
-        // Convert to FP4 and pack.
-        // cvt_e2m1x4_rn(a,b,c,d) → bits[3:0]=d, [7:4]=c, [11:8]=b, [15:12]=a
-        // Memory packing: byte0 = {col1_hi, col0_lo}, byte1 = {col3_hi, col2_lo}
-        // So 16-bit word needs bits[3:0]=col0, [7:4]=col1, [11:8]=col2, [15:12]=col3
-        // → call with reversed order: cvt_e2m1x4_rn(col3, col2, col1, col0)
-        uint16_t packed_lo, packed_hi;
-        if constexpr (kEnableStochasticRounding) {
-            const uint64_t rng_seed   = rng_state ? rng_state[0] : 0;
-            const uint64_t rng_offset = rng_state ? rng_state[1] : 0;
-            const uint64_t rng_seq    = threadIdx.x + (uint64_t)blockIdx.x * blockDim.x
-                                      + (uint64_t)blockIdx.y * blockDim.x * gridDim.x;
-            Philox4x32 rng;
-            rng.init(rng_seed, rng_seq, rng_offset);
-            uint4 rand = rng.generate();
-
-            packed_lo = cvt_e2m1x4_sr(vals[3], vals[2], vals[1], vals[0], rand.x);
-            packed_hi = cvt_e2m1x4_sr(vals[7], vals[6], vals[5], vals[4], rand.y);
-        } else {
-            packed_lo = cvt_e2m1x4_rn(vals[3], vals[2], vals[1], vals[0]);
-            packed_hi = cvt_e2m1x4_rn(vals[7], vals[6], vals[5], vals[4]);
-        }
-
-        uint32_t packed = static_cast<uint32_t>(packed_lo)
-                        | (static_cast<uint32_t>(packed_hi) << 16);
-
-        // Write FP4 output: C is row-major, 2 values per byte
-        // Byte offset = (global_row * N + col_start + half * 8) / 2
-        int byte_offset = (global_row * N + col_start + half * 8) / 2;
-        *reinterpret_cast<uint32_t*>(C + byte_offset) = packed;
-
-        // Write SFC: one per row per 16-col group
-        if (half == 0) {
-            int sfc_idx = global_row * (N / TILE_N) + col_group;
-            SFC[sfc_idx] = pvscale_fp8;
-        }
+        __syncthreads();  // Before next group overwrites smem_A
     }
 }
 
@@ -375,7 +351,7 @@ void rht_gemm_ntt_w_sfc(
     assert(m % TILE_M == 0 && "M must be a multiple of 128");
     assert(n % (4 * TILE_N) == 0 && "N must be a multiple of 64");
 
-    dim3 grid(m / TILE_M, n / TILE_N);
+    dim3 grid(m / TILE_M, (n + TILE_N_BLOCK - 1) / TILE_N_BLOCK);
     dim3 block(THREADS_PER_BLOCK);
 
     int smem_size = TILE_M * TILE_N * sizeof(__nv_bfloat16)
