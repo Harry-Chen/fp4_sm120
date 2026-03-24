@@ -92,6 +92,20 @@ unsigned short cvt_e2m1x4_rn(float a, float b, float c, float d) {
 }
 
 // ===================================================================
+// Standalone FP32x4 -> E2M1x4 SR (convenience wrapper)
+// ===================================================================
+
+__device__ __forceinline__
+unsigned short fp32x4_to_e2m1x4_sr(float a, float b, float c, float d,
+                                     unsigned rbits) {
+    a = apply_sr_noise_e2m1(a, (rbits      ) & 0xFFu);
+    b = apply_sr_noise_e2m1(b, (rbits >>  8) & 0xFFu);
+    c = apply_sr_noise_e2m1(c, (rbits >> 16) & 0xFFu);
+    d = apply_sr_noise_e2m1(d, (rbits >> 24) & 0xFFu);
+    return cvt_e2m1x4_rn(a, b, c, d);
+}
+
+// ===================================================================
 // Main conversion: drop-in replacement
 // ===================================================================
 
@@ -125,20 +139,6 @@ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     fp4e2m1x4 result;
     result.__x = fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
     return result;
-}
-
-// ===================================================================
-// Standalone FP32x4 -> E2M1x4 SR (convenience wrapper)
-// ===================================================================
-
-__device__ __forceinline__
-unsigned short fp32x4_to_e2m1x4_sr(float a, float b, float c, float d,
-                                     unsigned rbits) {
-    a = apply_sr_noise_e2m1(a, (rbits      ) & 0xFFu);
-    b = apply_sr_noise_e2m1(b, (rbits >>  8) & 0xFFu);
-    c = apply_sr_noise_e2m1(c, (rbits >> 16) & 0xFFu);
-    d = apply_sr_noise_e2m1(d, (rbits >> 24) & 0xFFu);
-    return cvt_e2m1x4_rn(a, b, c, d);
 }
 
 // ===================================================================
