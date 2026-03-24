@@ -44,8 +44,9 @@ float apply_sr_noise_e2m1(float x, unsigned rand_byte) {
     }
 
     // Symmetric noise in [-ULP/2, ULP/2)
-    // (rand_byte - 128) / 256 * ULP
-    float noise = (float)((int)rand_byte - 128) * __uint_as_float(0x3B800000u) * ulp;
+    // (rand_byte - 127.5f) / 256 * ULP
+    // rand_byte is {-128, ..., 127}, avg is -0.5
+    float noise = (float)((int)rand_byte - 127.5f) * __uint_as_float(0x3B800000u) * ulp;
 
     // Clamp: prevent noise from pushing below x_lo (ULP boundary crossing)
     float ax_noisy = fmaxf(fabsf(x) + noise, x_lo_abs);
