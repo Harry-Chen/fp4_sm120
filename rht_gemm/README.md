@@ -72,16 +72,20 @@ On RTX 5090 (1792 GB/s memory bandwidth):
 
 | Size (m × n) | Time (ms) | Bandwidth (GB/s) | % of Peak |
 |---|---|---|---|
-| 1024 × 1024 | 0.004 | 641 | 36% |
-| 4096 × 4096 | 0.037 | 1165 | 65% |
-| 8192 × 5120 | 0.091 | 1188 | 66% |
-| 8192 × 10240 | 0.179 | 1200 | 67% |
+| 1024 × 1024 | 0.006 | 431 | 24% |
+| 2048 × 2048 | 0.012 | 871 | 49% |
+| 4096 × 4096 | 0.035 | 1216 | 68% |
+| 8192 × 5120 | 0.085 | 1259 | 70% |
+| 8192 × 10240 | 0.169 | 1270 | 71% |
 
-The kernel is memory-bound (arithmetic intensity ~12.7 FLOP/byte). Current
-implementation achieves ~67% of peak bandwidth at large sizes.
+The kernel is memory-bound (arithmetic intensity ~12.7 FLOP/byte). The ~29%
+gap to peak is primarily due to write amplification: FP4 output is row-major
+with stride N/2 bytes between rows, causing scattered writes that hit many
+L2 cache lines.
 
 ## Files
 
 - `rht_gemm_sm120.cuh` — Main kernel header (drop-in replacement)
 - `test_correctness.cu` — Correctness test vs naive CPU reference + benchmark
+- `test_compare.cu` — Comparison test for SM100 vs SM120 output
 - `te_ref/` — Original Transformer Engine reference implementation (SM100 only)
