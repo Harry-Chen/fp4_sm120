@@ -54,9 +54,9 @@ __global__ void test_sr_probability(
 
     for (int i = 0; i < trials_per_thread; i++) {
         unsigned rbits = curand(&rng);
-        // Put x in nibble 0 (first arg to fp32x4_to_e2m1x4_sr)
-        unsigned short packed = fp32x4_to_e2m1x4_sr(x, 0.0f, 0.0f, 0.0f, rbits);
-        unsigned code = packed & 0xFu;  // nibble 0 = first arg
+        // Put x in nibble 0 (last arg d -> nibble 0 in hardware layout)
+        unsigned short packed = fp32x4_to_e2m1x4_sr(0.0f, 0.0f, 0.0f, x, rbits);
+        unsigned code = packed & 0xFu;  // nibble 0 = arg d
         float decoded = e2m1_decode(code);
         if (fabsf(decoded) > fabsf(x)) {
             local_count++;
@@ -97,7 +97,7 @@ __global__ void test_sr_unbiasedness(
 
     for (int i = 0; i < trials_per_thread; i++) {
         unsigned rbits = curand(&rng);
-        unsigned short packed = fp32x4_to_e2m1x4_sr(x, 0.0f, 0.0f, 0.0f, rbits);
+        unsigned short packed = fp32x4_to_e2m1x4_sr(0.0f, 0.0f, 0.0f, x, rbits);
         unsigned code = packed & 0xFu;
         local_sum += (double)e2m1_decode(code);
     }
@@ -134,7 +134,7 @@ __global__ void test_exact_values(int *failures) {
 
     for (int i = 0; i < 1000; i++) {
         unsigned rbits = curand(&rng);
-        unsigned short packed = fp32x4_to_e2m1x4_sr(x, 0.0f, 0.0f, 0.0f, rbits);
+        unsigned short packed = fp32x4_to_e2m1x4_sr(0.0f, 0.0f, 0.0f, x, rbits);
         unsigned code = packed & 0xFu;
         float decoded = e2m1_decode(code);
         if (decoded != x && !(x == 0.0f && decoded == 0.0f)) {
@@ -164,7 +164,7 @@ __global__ void test_saturation(int *failures) {
 
     for (int i = 0; i < 1000; i++) {
         unsigned rbits = curand(&rng);
-        unsigned short packed = fp32x4_to_e2m1x4_sr(x, 0.0f, 0.0f, 0.0f, rbits);
+        unsigned short packed = fp32x4_to_e2m1x4_sr(0.0f, 0.0f, 0.0f, x, rbits);
         unsigned code = packed & 0xFu;
         float decoded = e2m1_decode(code);
         float expected = (x > 0.0f) ? 6.0f : -6.0f;
@@ -186,13 +186,15 @@ __global__ void test_all_lanes(int *failures) {
     curandState rng;
     curand_init(555u, threadIdx.x, 0, &rng);
 
-    float vals[] = {0.7f, -1.3f, 2.5f, -4.8f};
+    // cvt_e2m1x4_rn(a,b,c,d) → nibble0=d, nibble1=c, nibble2=b, nibble3=a
+    float args[] = {0.7f, -1.3f, 2.5f, -4.8f};   // a, b, c, d
+    float expect_nibble[] = {-4.8f, 2.5f, -1.3f, 0.7f};  // d, c, b, a
     int local_fail = 0;
 
     for (int i = 0; i < 1000; i++) {
         unsigned rbits = curand(&rng);
         unsigned short packed = fp32x4_to_e2m1x4_sr(
-            vals[0], vals[1], vals[2], vals[3], rbits);
+            args[0], args[1], args[2], args[3], rbits);
 
         for (int lane = 0; lane < 4; lane++) {
             unsigned code = (packed >> (lane * 4)) & 0xFu;
@@ -202,7 +204,7 @@ __global__ void test_all_lanes(int *failures) {
                           mag == 1.5f || mag == 2.0f || mag == 3.0f ||
                           mag == 4.0f || mag == 6.0f);
             bool sign_ok = (decoded == 0.0f) ||
-                           ((decoded > 0.0f) == (vals[lane] > 0.0f));
+                           ((decoded > 0.0f) == (expect_nibble[lane] > 0.0f));
             if (!valid || !sign_ok) local_fail++;
         }
     }

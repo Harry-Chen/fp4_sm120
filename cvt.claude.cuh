@@ -197,9 +197,9 @@ fp4e2m1x4 cvt_fp32_to_fp4_4x_with_stochastic_rounding(
 // 8x BF16->FP4 with stochastic rounding and scalar scale
 // ===================================================================
 //
-// Original asm packs {v3, v2, v1, v0} for each group of 4:
-//   b03: nibble0=v3, nibble1=v2, nibble2=v1, nibble3=v0
-//   b47: nibble0=v7, nibble1=v6, nibble2=v5, nibble3=v4
+// Original asm: cvt.rs {v3, v2, v1, v0} — hardware reversed layout gives:
+//   b03: nibble0=v0, nibble1=v1, nibble2=v2, nibble3=v3
+//   b47: nibble4=v4, nibble5=v5, nibble6=v6, nibble7=v7
 //   result = b03 | (b47 << 16)
 
 template <typename ScaleT>
