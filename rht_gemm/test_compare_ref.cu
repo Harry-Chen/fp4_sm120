@@ -53,24 +53,38 @@ using cute::Tensor;
 
 // clang-format on
 
-// ---- Concrete wrapper callable from the main TU ----
+// ---- Concrete wrappers callable from the main TU ----
+using TA   = cute::bfloat16_t;
+using TB   = cute::bfloat16_t;
+using TC   = cutlass::float_e2m1_t;
+using TSFC = cutlass::float_ue4m3_t;
+
+// Call rht_gemm_ntt_w_sfc directly (NOT ttt_wrapper which swaps m/n).
+#define LAUNCH_REF(SR, FM)                                                     \
+    transformer_engine::detail::rht_gemm_ntt_w_sfc<TA, TB, TC, TSFC, SR, FM>( \
+        m, n, reinterpret_cast<TA const*>(A), reinterpret_cast<TB const*>(B),  \
+        reinterpret_cast<TC*>(C), reinterpret_cast<TSFC*>(SFC),               \
+        global_amax, rng_state, sm_count, stream)
+
+// <SR=false, FastMath=false>
 void run_ref(int m, int n,
              const __nv_bfloat16* A, const __nv_bfloat16* B,
              uint8_t* C, uint8_t* SFC,
              const float* global_amax, const size_t* rng_state,
-             uint32_t sm_count, cudaStream_t stream) {
-    using TA   = cute::bfloat16_t;
-    using TB   = cute::bfloat16_t;
-    using TC   = cutlass::float_e2m1_t;
-    using TSFC = cutlass::float_ue4m3_t;
+             uint32_t sm_count, cudaStream_t stream) { LAUNCH_REF(false, false); }
 
-    // Call rht_gemm_ntt_w_sfc directly (NOT ttt_wrapper which swaps m/n).
-    // Our SM120 kernel uses the NTT convention: A is m×n col-major.
-    transformer_engine::detail::rht_gemm_ntt_w_sfc<TA, TB, TC, TSFC, false, false>(
-        m, n,
-        reinterpret_cast<TA const*>(A),
-        reinterpret_cast<TB const*>(B),
-        reinterpret_cast<TC*>(C),
-        reinterpret_cast<TSFC*>(SFC),
-        global_amax, rng_state, sm_count, stream);
-}
+// <SR=false, FastMath=true>
+void run_ref_fast(int m, int n,
+                  const __nv_bfloat16* A, const __nv_bfloat16* B,
+                  uint8_t* C, uint8_t* SFC,
+                  const float* global_amax, const size_t* rng_state,
+                  uint32_t sm_count, cudaStream_t stream) { LAUNCH_REF(false, true); }
+
+// <SR=true, FastMath=false>
+void run_ref_sr(int m, int n,
+                const __nv_bfloat16* A, const __nv_bfloat16* B,
+                uint8_t* C, uint8_t* SFC,
+                const float* global_amax, const size_t* rng_state,
+                uint32_t sm_count, cudaStream_t stream) { LAUNCH_REF(true, false); }
+
+#undef LAUNCH_REF

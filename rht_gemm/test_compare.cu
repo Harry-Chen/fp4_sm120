@@ -16,18 +16,23 @@
 #include <vector>
 
 // Defined in test_compare_ours.cu
-extern void run_ours(int m, int n,
-                     const __nv_bfloat16* A, const __nv_bfloat16* B,
-                     uint8_t* C, uint8_t* SFC,
-                     const float* global_amax, const size_t* rng_state,
-                     uint32_t sm_count, cudaStream_t stream);
+extern void run_ours(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                     uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
+extern void run_ours_fast(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                          uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
+extern void run_ours_sr(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                        uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
 
 // Defined in test_compare_ref.cu
-extern void run_ref(int m, int n,
-                    const __nv_bfloat16* A, const __nv_bfloat16* B,
-                    uint8_t* C, uint8_t* SFC,
-                    const float* global_amax, const size_t* rng_state,
-                    uint32_t sm_count, cudaStream_t stream);
+extern void run_ref(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                    uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
+extern void run_ref_fast(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                         uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
+extern void run_ref_sr(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                       uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
+
+using KernelFn = void(*)(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+                          uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t);
 
 #define CHECK_CUDA(call)                                                    \
     do {                                                                    \
@@ -41,6 +46,16 @@ extern void run_ref(int m, int n,
 
 static uint8_t get_nibble(const uint8_t* data, int idx) {
     return (idx % 2 == 0) ? (data[idx / 2] & 0xF) : (data[idx / 2] >> 4);
+}
+
+static float fp4_to_float(uint8_t nibble) {
+    nibble &= 0xF;
+    int sign = (nibble >> 3) & 1;
+    int exp  = (nibble >> 1) & 3;
+    int mant = nibble & 1;
+    float val = (exp == 0) ? (mant ? 0.5f : 0.0f)
+                           : (1.0f + mant * 0.5f) * (float)(1 << (exp - 1));
+    return sign ? -val : val;
 }
 
 // Benchmark a kernel: warmup + timed runs, returns average milliseconds.
@@ -89,7 +104,10 @@ static void fill_hadamard(std::vector<__nv_bfloat16>& h_B) {
 bool run_comparison(int M, int N,
                     const char* label = nullptr,
                     std::vector<__nv_bfloat16>* custom_A = nullptr,
-                    float global_amax_val = 4.0f) {
+                    float global_amax_val = 4.0f,
+                    KernelFn fn_ours = run_ours,
+                    KernelFn fn_ref = run_ref,
+                    bool statistical_only = false) {
     if (label)
         printf("--- %s (%d x %d, amax=%.4g) ---\n", label, M, N, global_amax_val);
     else
@@ -140,9 +158,9 @@ bool run_comparison(int M, int N,
 
     // ---- Correctness comparison ----
     printf("  Correctness check...\n");
-    run_ours(M, N, d_A, d_B, d_C_ours, d_SFC_ours, d_amax, d_rng, sm_count, 0);
+    fn_ours(M, N, d_A, d_B, d_C_ours, d_SFC_ours, d_amax, d_rng, sm_count, 0);
     CHECK_CUDA(cudaDeviceSynchronize());
-    run_ref(M, N, d_A, d_B, d_C_ref, d_SFC_ref, d_amax, d_rng, sm_count, 0);
+    fn_ref(M, N, d_A, d_B, d_C_ref, d_SFC_ref, d_amax, d_rng, sm_count, 0);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<uint8_t> h_C_ours(c_bytes), h_C_ref(c_bytes);
@@ -176,14 +194,46 @@ bool run_comparison(int M, int N,
            sfc_bytes ? 100.0 * sfc_mm / sfc_bytes : 0.0);
     printf("  FP4: %d / %d mismatches (%.4f%%)\n", fp4_mm, M * N,
            M * N ? 100.0 * fp4_mm / (M * N) : 0.0);
-    bool ok = (fp4_mm == 0 && sfc_mm == 0);
-    printf("  Correctness: %s\n", ok ? "MATCH" : "MISMATCH");
+
+    bool ok;
+    if (statistical_only) {
+        // SR mode: can't compare bit-exact (different RNG sequences).
+        // Check that mean FP4 values are close and SFC distributions are similar.
+        double mean_ours = 0, mean_ref = 0;
+        for (int i = 0; i < M * N; i++) {
+            mean_ours += fp4_to_float(get_nibble(h_C_ours.data(), i));
+            mean_ref  += fp4_to_float(get_nibble(h_C_ref.data(), i));
+        }
+        mean_ours /= (M * N);
+        mean_ref  /= (M * N);
+
+        double sfc_mean_ours = 0, sfc_mean_ref = 0;
+        for (size_t i = 0; i < sfc_bytes; i++) {
+            sfc_mean_ours += h_SFC_ours[i];
+            sfc_mean_ref  += h_SFC_ref[i];
+        }
+        sfc_mean_ours /= sfc_bytes;
+        sfc_mean_ref  /= sfc_bytes;
+
+        printf("  FP4 mean: ours=%.6f ref=%.6f (diff=%.2e)\n",
+               mean_ours, mean_ref, fabs(mean_ours - mean_ref));
+        printf("  SFC mean: ours=%.2f ref=%.2f (diff=%.2f)\n",
+               sfc_mean_ours, sfc_mean_ref, fabs(sfc_mean_ours - sfc_mean_ref));
+
+        // Pass if means are within 5% relative or 0.01 absolute
+        ok = (fabs(mean_ours - mean_ref) < fmax(0.01, 0.05 * fmax(fabs(mean_ours), fabs(mean_ref))))
+          && (fabs(sfc_mean_ours - sfc_mean_ref) < fmax(1.0, 0.05 * fmax(sfc_mean_ours, sfc_mean_ref)));
+        printf("  Statistical: %s\n", ok ? "SIMILAR" : "DIVERGENT");
+    } else {
+        ok = (fp4_mm == 0 && sfc_mm == 0);
+        printf("  Correctness: %s\n", ok ? "MATCH" : "MISMATCH");
+    }
 
     // ---- Performance benchmark (only if correctness passes) ----
     if (ok) {
-        float ms_ours = benchmark_kernel(run_ours, M, N, d_A, d_B,
+        float ms_ours = benchmark_kernel(fn_ours, M, N, d_A, d_B,
                                          d_C_ours, d_SFC_ours, d_amax, d_rng, sm_count);
-        float ms_ref  = benchmark_kernel(run_ref,  M, N, d_A, d_B,
+        float ms_ref  = benchmark_kernel(fn_ref,  M, N, d_A, d_B,
                                          d_C_ref,  d_SFC_ref,  d_amax, d_rng, sm_count);
 
         // FLOP count: N/16 independent 16x16 matmuls per row, M rows.
@@ -233,10 +283,32 @@ int main() {
     int pass = 0, total = 0;
     auto test = [&](int m, int n) { total++; if (run_comparison(m, n)) pass++; };
 
-    // Standard random data
+    // Standard random data (SR=false, FastMath=false — exact match)
     test(256, 128);
     test(1024, 1024);
     test(8192, 5120);
+
+    // FastMath mode (SR=false, FastMath=true — exact match expected)
+    printf("\n=== FastMath Mode Tests ===\n");
+    auto test_fast = [&](int m, int n) {
+        total++;
+        if (run_comparison(m, n, "fast_math", nullptr, 4.0f,
+                           run_ours_fast, run_ref_fast, false)) pass++;
+    };
+    test_fast(256, 128);
+    test_fast(1024, 1024);
+
+    // Stochastic Rounding mode (SR=true — statistical comparison only,
+    // because the RNG sequence mapping differs between kernels)
+    printf("\n=== Stochastic Rounding Tests (statistical) ===\n");
+    auto test_sr = [&](int m, int n) {
+        total++;
+        if (run_comparison(m, n, "stochastic_rounding", nullptr, 4.0f,
+                           run_ours_sr, run_ref_sr, true)) pass++;
+    };
+    test_sr(256, 128);
+    test_sr(1024, 1024);
+    test_sr(8192, 5120);
 
     // Extreme data tests — compare both kernels with edge-case inputs
     printf("\n=== Extreme Data Tests ===\n");
