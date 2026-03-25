@@ -39,6 +39,26 @@ static constexpr float FP4_MAX = 6.0f;
 static constexpr float FP8_E4M3_MAX = 448.0f;
 
 // ============================================================
+// NaN-propagating min/max (matching CUTLASS minimum/maximum_with_nan_propagation)
+// CUDA's fminf/fmaxf follow IEEE 754-2008 which treats NaN as "missing" —
+// the reference kernel uses NaN-propagating variants so we must too.
+// ============================================================
+
+__device__ __forceinline__
+float fmax_nan_prop(float a, float b) {
+    float r;
+    asm("max.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+__device__ __forceinline__
+float fmin_nan_prop(float a, float b) {
+    float r;
+    asm("min.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+// ============================================================
 // FP8 UE4M3 conversion helpers (unsigned E4M3, range [0, 448])
 // ============================================================
 
@@ -60,42 +80,54 @@ float ue4m3_to_float(uint8_t val) {
 }
 
 // ============================================================
-// Philox4x32-10 RNG
+// Philox4x32-10 RNG — matches TE's curanddx implementation.
+// Counter layout: ctr = {offset_lo, offset_hi, subseq_lo, subseq_hi}
+// with carry propagation on skip_offset / skip_subsequence.
 // ============================================================
 
 struct Philox4x32 {
-    uint32_t ctr[4];
-    uint32_t key[2];
+    uint4 ctr;
+    uint2 key;
 
-    __device__ void init(uint64_t seed, uint64_t sequence, uint64_t offset) {
-        ctr[0] = static_cast<uint32_t>(sequence);
-        ctr[1] = static_cast<uint32_t>(sequence >> 32);
-        ctr[2] = static_cast<uint32_t>(offset);
-        ctr[3] = static_cast<uint32_t>(offset >> 32);
-        key[0] = static_cast<uint32_t>(seed);
-        key[1] = static_cast<uint32_t>(seed >> 32);
+    __device__ void init(uint64_t seed, uint64_t subsequence, uint64_t offset) {
+        ctr = make_uint4(0, 0, 0, 0);
+        key.x = static_cast<uint32_t>(seed);
+        key.y = static_cast<uint32_t>(seed >> 32);
+        // skip_subsequence: increment ctr.z/w
+        uint32_t nlo = static_cast<uint32_t>(subsequence);
+        uint32_t nhi = static_cast<uint32_t>(subsequence >> 32);
+        ctr.z += nlo;
+        if (ctr.z < nlo) nhi++;
+        ctr.w += nhi;
+        // skip_offset: increment ctr.x/y
+        nlo = static_cast<uint32_t>(offset);
+        nhi = static_cast<uint32_t>(offset >> 32);
+        ctr.x += nlo;
+        if (ctr.x < nlo) nhi++;
+        ctr.y += nhi;
     }
 
     __device__ uint4 generate() {
-        uint32_t c[4] = {ctr[0], ctr[1], ctr[2], ctr[3]};
-        uint32_t k[2] = {key[0], key[1]};
-        for (int i = 0; i < 10; i++) {
-            round(c, k);
-            k[0] += 0x9E3779B9u;
-            k[1] += 0xBB67AE85u;
+        uint4 c = ctr;
+        uint2 k = key;
+        #pragma unroll
+        for (int i = 0; i < 9; i++) {
+            c = single_round(c, k);
+            k.x += 0x9E3779B9u;
+            k.y += 0xBB67AE85u;
         }
-        ctr[0]++;
-        if (ctr[0] == 0) ctr[1]++;
-        return {c[0], c[1], c[2], c[3]};
+        c = single_round(c, k);
+        // Increment counter with carry
+        if (++ctr.x == 0) if (++ctr.y == 0) if (++ctr.z == 0) ++ctr.w;
+        return c;
     }
 
-    __device__ static void round(uint32_t* c, const uint32_t* k) {
-        uint64_t r0 = static_cast<uint64_t>(0xD2511F53u) * c[0];
-        uint64_t r1 = static_cast<uint64_t>(0xCD9E8D57u) * c[2];
-        c[0] = static_cast<uint32_t>(r1 >> 32) ^ c[1] ^ k[0];
-        c[1] = static_cast<uint32_t>(r1);
-        c[2] = static_cast<uint32_t>(r0 >> 32) ^ c[3] ^ k[1];
-        c[3] = static_cast<uint32_t>(r0);
+    __device__ static uint4 single_round(uint4 c, uint2 k) {
+        uint32_t hi0 = __umulhi(0xD2511F53u, c.x);
+        uint32_t lo0 = 0xD2511F53u * c.x;
+        uint32_t hi1 = __umulhi(0xCD9E8D57u, c.z);
+        uint32_t lo1 = 0xCD9E8D57u * c.z;
+        return make_uint4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
     }
 };
 
@@ -214,14 +246,22 @@ rht_gemm_kernel(
                 }
             }
 
+            // Amax with NaN propagation (matching reference's
+            // cutlass::maximum_absolute_value_reduction<..., true>).
+            // Use fast fmaxf in the hot loop; detect NaN via per-element
+            // flag OR (compiled to predicated set + OR, no branch).
             float local_max = 0.0f;
+            int has_nan = 0;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
+                has_nan |= __isnanf(vals[i]);
                 local_max = fmaxf(local_max, fabsf(vals[i]));
             }
+            has_nan |= __shfl_xor_sync(0xFFFFFFFF, has_nan, 1);
 
             float other_max = __shfl_xor_sync(0xFFFFFFFF, local_max, 1);
             float row_max = fmaxf(local_max, other_max);
+            if (has_nan) row_max = NAN;
 
             float pvscale = row_max * scale_multiplier;
             uint8_t pvscale_fp8 = float_to_ue4m3(pvscale);
@@ -231,9 +271,11 @@ rht_gemm_kernel(
             if constexpr (kUseFastMath) {
                 acc_scale = __frcp_rn(qpvscale_scaled);
             } else {
-                acc_scale = (qpvscale_scaled != 0.0f) ? (1.0f / qpvscale_scaled) : FLT_MAX;
+                // Reference uses cutlass::divides (IEEE 754: 1/0 → Inf)
+                acc_scale = 1.0f / qpvscale_scaled;
             }
-            acc_scale = fminf(acc_scale, FLT_MAX);
+            // NaN-propagating clamp (matching reference's minimum_with_nan_propagation)
+            acc_scale = fmin_nan_prop(acc_scale, FLT_MAX);
 
             #pragma unroll
             for (int i = 0; i < 8; i++) {
