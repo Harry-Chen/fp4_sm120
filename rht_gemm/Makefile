@@ -14,14 +14,13 @@ test_correctness.exe: test_correctness.cu rht_gemm_sm120.cuh
 
 # SM100 comparison test: our kernel vs TE reference, run on GB200.
 # Compiled as 3 TUs to avoid include conflicts between sr.sm120.cuh and TE ptx.cuh.
-TE_HOME ?= /home/harry/TransformerEngine
-TE_INC := -Ite_ref/stubs -I$(TE_HOME)/transformer_engine -I$(TE_HOME)/transformer_engine/common/include
+# All TE headers are vendored under te_ref/stubs/ — no external TE tree needed.
 SM100_FLAGS := -gencode=arch=compute_100a,code=sm_100a $(NVCC_COMMON_FLAGS) -rdc=true --expt-relaxed-constexpr
 
 test_compare.exe: test_compare.cu test_compare_ours.cu test_compare_ref.cu rht_gemm_sm120.cuh
 	$(NVCC) $(SM100_FLAGS) -c test_compare.cu -o test_compare_main.o
 	$(NVCC) $(SM100_FLAGS) -c test_compare_ours.cu -o test_compare_ours.o
-	$(NVCC) $(SM100_FLAGS) $(TE_INC) -c test_compare_ref.cu -o test_compare_ref.o
+	$(NVCC) $(SM100_FLAGS) -Ite_ref/stubs -c test_compare_ref.cu -o test_compare_ref.o
 	$(NVCC) $(SM100_FLAGS) test_compare_main.o test_compare_ours.o test_compare_ref.o -o $@
 	rm -f test_compare_main.o test_compare_ours.o test_compare_ref.o
 
