@@ -1,0 +1,2 @@
+# Exclude vendored/reference code from GitHub language statistics
+rht_gemm/te_ref/** linguist-vendored
