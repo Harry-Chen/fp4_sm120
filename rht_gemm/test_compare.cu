@@ -1,26 +1,33 @@
-// Comparison test: SM120 kernel vs SM100 reference (rht_gemm_ntt_w_sfc).
+// Comparison test: our SM120 kernel vs the original TE SM100 reference.
 //
-// This test is designed to run on a machine with BOTH SM100 and SM120 GPUs
-// (e.g., GB200 + RTX 5090), or compiled twice for each architecture.
+// Both kernels run on the SAME SM100 GPU (e.g. GB200) with identical inputs.
+// The two kernels live in separate translation units to avoid include conflicts
+// between sr.sm120.cuh and TE's ptx.cuh.
 //
-// Build for SM100 (for GB200): make test_compare.exe
-// Build for SM120 (for 5090):  make test_compare.exe CUDA_ARCH=120a
-//
-// When compiled for SM120, this test only runs the SM120 kernel and
-// saves the output to a file. The SM100 version does the same. The
-// outputs can then be compared offline.
+// Build: make test_compare.exe   (requires compute_100a)
+// Run:   on a GB200 or B200 machine
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <random>
 #include <vector>
-#include <fstream>
 
-#include "rht_gemm_sm120.cuh"
+// Defined in test_compare_ours.cu
+extern void run_ours(int m, int n,
+                     const __nv_bfloat16* A, const __nv_bfloat16* B,
+                     uint8_t* C, uint8_t* SFC,
+                     const float* global_amax, const size_t* rng_state,
+                     uint32_t sm_count, cudaStream_t stream);
+
+// Defined in test_compare_ref.cu
+extern void run_ref(int m, int n,
+                    const __nv_bfloat16* A, const __nv_bfloat16* B,
+                    uint8_t* C, uint8_t* SFC,
+                    const float* global_amax, const size_t* rng_state,
+                    uint32_t sm_count, cudaStream_t stream);
 
 #define CHECK_CUDA(call)                                                    \
     do {                                                                    \
@@ -32,153 +39,129 @@
         }                                                                   \
     } while (0)
 
-void run_and_save(int M, int N, const char* output_prefix) {
+static uint8_t get_nibble(const uint8_t* data, int idx) {
+    return (idx % 2 == 0) ? (data[idx / 2] & 0xF) : (data[idx / 2] >> 4);
+}
+
+bool run_comparison(int M, int N) {
+    printf("--- %d x %d ---\n", M, N);
+
     std::mt19937 gen(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
-    std::vector<__nv_bfloat16> h_A(M * N);
-    std::vector<__nv_bfloat16> h_B(16 * 16);
-
-    for (int i = 0; i < M * N; i++)
-        h_A[i] = __float2bfloat16(dist(gen));
-
+    std::vector<__nv_bfloat16> h_A(M * N), h_B(16 * 16);
+    for (auto& v : h_A) v = __float2bfloat16(dist(gen));
     for (int r = 0; r < 16; r++)
         for (int c = 0; c < 16; c++) {
             int sign = __builtin_popcount(r & c) % 2 == 0 ? 1 : -1;
             h_B[r * 16 + c] = __float2bfloat16(sign * 0.25f);
         }
-
     float global_amax_val = 4.0f;
+    size_t rng_h[2] = {12345, 0};
 
     __nv_bfloat16 *d_A, *d_B;
-    uint8_t *d_C, *d_SFC;
-    float *d_global_amax;
-    size_t *d_rng_state;
+    float *d_amax;
+    size_t *d_rng;
+    uint8_t *d_C_ours, *d_SFC_ours, *d_C_ref, *d_SFC_ref;
+
+    size_t c_bytes = M * N / 2;
+    size_t sfc_bytes = M * (N / 16);
 
     CHECK_CUDA(cudaMalloc(&d_A, M * N * sizeof(__nv_bfloat16)));
     CHECK_CUDA(cudaMalloc(&d_B, 256 * sizeof(__nv_bfloat16)));
-    CHECK_CUDA(cudaMalloc(&d_C, M * N / 2));
-    CHECK_CUDA(cudaMalloc(&d_SFC, M * (N / 16)));
-    CHECK_CUDA(cudaMalloc(&d_global_amax, sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_rng_state, 2 * sizeof(size_t)));
+    CHECK_CUDA(cudaMalloc(&d_amax, sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_rng, 2 * sizeof(size_t)));
+    CHECK_CUDA(cudaMalloc(&d_C_ours, c_bytes));
+    CHECK_CUDA(cudaMalloc(&d_SFC_ours, sfc_bytes));
+    CHECK_CUDA(cudaMalloc(&d_C_ref, c_bytes));
+    CHECK_CUDA(cudaMalloc(&d_SFC_ref, sfc_bytes));
 
     CHECK_CUDA(cudaMemcpy(d_A, h_A.data(), M * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), 256 * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_global_amax, &global_amax_val, sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_amax, &global_amax_val, sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_rng, rng_h, 2 * sizeof(size_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_C_ours, 0, c_bytes));
+    CHECK_CUDA(cudaMemset(d_SFC_ours, 0, sfc_bytes));
+    CHECK_CUDA(cudaMemset(d_C_ref, 0, c_bytes));
+    CHECK_CUDA(cudaMemset(d_SFC_ref, 0, sfc_bytes));
 
-    size_t rng_state[2] = {12345, 0};
-    CHECK_CUDA(cudaMemcpy(d_rng_state, rng_state, 2 * sizeof(size_t), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemset(d_C, 0, M * N / 2));
-    CHECK_CUDA(cudaMemset(d_SFC, 0, M * (N / 16)));
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    uint32_t sm_count = prop.multiProcessorCount;
 
-    // Run SM120 kernel
-    rht_gemm_sm120::rht_gemm_ntt_w_sfc<__nv_bfloat16, __nv_bfloat16, uint8_t, uint8_t, false, false>(
-        M, N, d_A, d_B, d_C, d_SFC, d_global_amax, d_rng_state, 170, 0);
+    printf("  Running our SM120 kernel...\n");
+    run_ours(M, N, d_A, d_B, d_C_ours, d_SFC_ours, d_amax, d_rng, sm_count, 0);
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Copy back
-    std::vector<uint8_t> h_C(M * N / 2);
-    std::vector<uint8_t> h_SFC(M * (N / 16));
-    CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, M * N / 2, cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_SFC.data(), d_SFC, M * (N / 16), cudaMemcpyDeviceToHost));
+    printf("  Running TE SM100 reference...\n");
+    run_ref(M, N, d_A, d_B, d_C_ref, d_SFC_ref, d_amax, d_rng, sm_count, 0);
+    CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Save to files
-    char fname[256];
-    snprintf(fname, sizeof(fname), "%s_C_%dx%d.bin", output_prefix, M, N);
-    {
-        std::ofstream f(fname, std::ios::binary);
-        f.write(reinterpret_cast<char*>(h_C.data()), h_C.size());
-        printf("Saved FP4 output to %s (%zu bytes)\n", fname, h_C.size());
-    }
-    snprintf(fname, sizeof(fname), "%s_SFC_%dx%d.bin", output_prefix, M, N);
-    {
-        std::ofstream f(fname, std::ios::binary);
-        f.write(reinterpret_cast<char*>(h_SFC.data()), h_SFC.size());
-        printf("Saved SFC to %s (%zu bytes)\n", fname, h_SFC.size());
-    }
+    std::vector<uint8_t> h_C_ours(c_bytes), h_C_ref(c_bytes);
+    std::vector<uint8_t> h_SFC_ours(sfc_bytes), h_SFC_ref(sfc_bytes);
+    CHECK_CUDA(cudaMemcpy(h_C_ours.data(), d_C_ours, c_bytes, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_C_ref.data(), d_C_ref, c_bytes, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_SFC_ours.data(), d_SFC_ours, sfc_bytes, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_SFC_ref.data(), d_SFC_ref, sfc_bytes, cudaMemcpyDeviceToHost));
+
+    int sfc_mm = 0;
+    for (size_t i = 0; i < sfc_bytes; i++)
+        if (h_SFC_ours[i] != h_SFC_ref[i]) {
+            if (++sfc_mm <= 5) {
+                int row = i / (N / 16), grp = i % (N / 16);
+                printf("  SFC mismatch row=%d group=%d: ours=0x%02X ref=0x%02X\n",
+                       row, grp, h_SFC_ours[i], h_SFC_ref[i]);
+            }
+        }
+
+    int fp4_mm = 0;
+    for (int i = 0; i < M * N; i++)
+        if (get_nibble(h_C_ours.data(), i) != get_nibble(h_C_ref.data(), i)) {
+            if (++fp4_mm <= 5) {
+                int r = i / N, c = i % N;
+                printf("  FP4 mismatch (%d,%d): ours=0x%X ref=0x%X\n",
+                       r, c, get_nibble(h_C_ours.data(), i), get_nibble(h_C_ref.data(), i));
+            }
+        }
+
+    printf("  SFC: %d / %zu mismatches (%.4f%%)\n", sfc_mm, sfc_bytes,
+           sfc_bytes ? 100.0 * sfc_mm / sfc_bytes : 0.0);
+    printf("  FP4: %d / %d mismatches (%.4f%%)\n", fp4_mm, M * N,
+           M * N ? 100.0 * fp4_mm / (M * N) : 0.0);
+    bool ok = (fp4_mm == 0 && sfc_mm == 0);
+    printf("  Result: %s\n\n", ok ? "MATCH" : "MISMATCH");
 
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
-    CHECK_CUDA(cudaFree(d_C));
-    CHECK_CUDA(cudaFree(d_SFC));
-    CHECK_CUDA(cudaFree(d_global_amax));
-    CHECK_CUDA(cudaFree(d_rng_state));
+    CHECK_CUDA(cudaFree(d_amax));
+    CHECK_CUDA(cudaFree(d_rng));
+    CHECK_CUDA(cudaFree(d_C_ours));
+    CHECK_CUDA(cudaFree(d_SFC_ours));
+    CHECK_CUDA(cudaFree(d_C_ref));
+    CHECK_CUDA(cudaFree(d_SFC_ref));
+    return ok;
 }
 
-void compare_files(const char* file1, const char* file2, const char* label) {
-    std::ifstream f1(file1, std::ios::binary);
-    std::ifstream f2(file2, std::ios::binary);
-
-    if (!f1.is_open()) { printf("Cannot open %s\n", file1); return; }
-    if (!f2.is_open()) { printf("Cannot open %s\n", file2); return; }
-
-    std::vector<uint8_t> d1((std::istreambuf_iterator<char>(f1)), std::istreambuf_iterator<char>());
-    std::vector<uint8_t> d2((std::istreambuf_iterator<char>(f2)), std::istreambuf_iterator<char>());
-
-    if (d1.size() != d2.size()) {
-        printf("%s: size mismatch (%zu vs %zu)\n", label, d1.size(), d2.size());
-        return;
-    }
-
-    int mismatches = 0;
-    for (size_t i = 0; i < d1.size(); i++) {
-        if (d1[i] != d2[i]) mismatches++;
-    }
-
-    printf("%s: %d / %zu mismatches (%.4f%%)\n",
-           label, mismatches, d1.size(), 100.0 * mismatches / d1.size());
-}
-
-int main(int argc, char** argv) {
-    printf("=== RHT GEMM SM120 vs SM100 Comparison ===\n\n");
+int main() {
+    printf("=== RHT GEMM: SM120 kernel vs TE SM100 reference ===\n\n");
 
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     printf("GPU: %s (SM %d.%d)\n\n", prop.name, prop.major, prop.minor);
 
-    if (argc >= 2 && strcmp(argv[1], "--compare") == 0) {
-        // Compare mode: compare two sets of output files
-        if (argc < 5) {
-            printf("Usage: %s --compare <prefix1> <prefix2> <MxN>\n", argv[0]);
-            return 1;
-        }
-        const char* prefix1 = argv[2];
-        const char* prefix2 = argv[3];
-        int M, N;
-        sscanf(argv[4], "%dx%d", &M, &N);
-
-        char f1[256], f2[256];
-        snprintf(f1, 256, "%s_C_%dx%d.bin", prefix1, M, N);
-        snprintf(f2, 256, "%s_C_%dx%d.bin", prefix2, M, N);
-        compare_files(f1, f2, "FP4 output");
-
-        snprintf(f1, 256, "%s_SFC_%dx%d.bin", prefix1, M, N);
-        snprintf(f2, 256, "%s_SFC_%dx%d.bin", prefix2, M, N);
-        compare_files(f1, f2, "SFC output");
-        return 0;
+    if (prop.major < 10) {
+        fprintf(stderr, "Error: SM100+ GPU required (got SM %d.%d).\n",
+                prop.major, prop.minor);
+        return 1;
     }
 
-    // Generate mode: run the kernel and save outputs
-    const char* prefix = "sm120";
-    if (argc >= 2) prefix = argv[1];
+    int pass = 0, total = 0;
+    auto test = [&](int m, int n) { total++; if (run_comparison(m, n)) pass++; };
 
-    struct TestCase { int m, n; };
-    TestCase tests[] = {
-        {256, 128},
-        {1024, 1024},
-        {8192, 5120},
-    };
+    test(256, 128);
+    test(1024, 1024);
+    test(8192, 5120);
 
-    for (auto& tc : tests) {
-        printf("--- %d x %d ---\n", tc.m, tc.n);
-        run_and_save(tc.m, tc.n, prefix);
-        printf("\n");
-    }
-
-    printf("Usage: Run on SM100 with prefix 'sm100', then compare:\n");
-    printf("  ./test_compare.exe sm120    # on RTX 5090\n");
-    printf("  ./test_compare.exe sm100    # on GB200\n");
-    printf("  ./test_compare.exe --compare sm100 sm120 8192x5120\n");
-
-    return 0;
+    printf("=== %d / %d tests matched ===\n", pass, total);
+    return (pass == total) ? 0 : 1;
 }
