@@ -64,7 +64,9 @@ void run_ref(int m, int n,
     using TC   = cutlass::float_e2m1_t;
     using TSFC = cutlass::float_ue4m3_t;
 
-    transformer_engine::detail::rht_gemm_ttt_wrapper<TA, TB, TC, TSFC, false, false>(
+    // Call rht_gemm_ntt_w_sfc directly (NOT ttt_wrapper which swaps m/n).
+    // Our SM120 kernel uses the NTT convention: A is m×n col-major.
+    transformer_engine::detail::rht_gemm_ntt_w_sfc<TA, TB, TC, TSFC, false, false>(
         m, n,
         reinterpret_cast<TA const*>(A),
         reinterpret_cast<TB const*>(B),
