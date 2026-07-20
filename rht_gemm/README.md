@@ -21,7 +21,9 @@ This implementation provides a drop-in replacement using:
   the `stochastic_rounding/` polyfill since `cvt.rs.satfinite.e2m1x4.f32` is
   not available on SM120.
 
-Shared memory usage is ~13KB per block, well within SM120's 99KB limit.
+Shared memory usage is ~18KB per block (smem_A 4352 B + smem_B 512 B +
+smem_result 8192 B + smem_packed 4096 B + smem_sfc 512 B), well within
+SM120's 99KB limit.
 
 ## Operation
 
@@ -92,26 +94,57 @@ kernel's includes (`sr.sm120.cuh`) from the TE reference's includes
 
 ## Performance
 
-On RTX 5090 (1792 GB/s memory bandwidth):
+On RTX 5090 (1792 GB/s memory bandwidth), measured with `bench_dram.cu`
+(each iteration reads a fresh buffer to defeat L2 caching, isolating true
+DRAM bandwidth):
 
-| Size (m × n) | Time (ms) | Bandwidth (GB/s) | % of Peak |
-|---|---|---|---|
-| 1024 × 1024 | 0.006 | 431 | 24% |
-| 2048 × 2048 | 0.012 | 871 | 49% |
-| 4096 × 4096 | 0.035 | 1216 | 68% |
-| 8192 × 5120 | 0.085 | 1259 | 70% |
-| 8192 × 10240 | 0.169 | 1270 | 71% |
+| Size (m × n) | Baseline (GB/s) | Optimized (GB/s) | Speedup | % of Peak |
+|---|---|---|---|---|
+| 1024 × 1024 | 418 | 434 | +4% | 24% |
+| 2048 × 2048 | 871 | 1304 | +50% | 73% |
+| 4096 × 4096 | 1162 | 1742 | +50% | 97% |
+| 8192 × 5120 | 1247 | 1867 | +50% | 104% |
+| 8192 × 10240 | 1264 | 1568 | +24% | 88% |
 
-The kernel is memory-bound (arithmetic intensity ~12.7 FLOP/byte). The ~29%
-gap to peak is primarily due to write amplification: FP4 output is row-major
-with stride N/2 bytes between rows, causing scattered writes that hit many
-L2 cache lines.
+The kernel is memory-bound (arithmetic intensity ~12.7 FLOP/byte). The
+remaining gap to peak at large sizes is primarily due to the row-major FP4
+output layout: within a warp, 4 consecutive rows are written per store
+cycle, each 32 bytes wide but N/2 bytes apart, causing 4× sector
+amplification on global stores. At smaller sizes (≤ 4096), the working
+set fits partially in L2, so measured bandwidth can exceed DRAM peak.
+
+### Optimizations
+
+The following optimizations were applied to the kernel:
+
+1. **Coalesced FP4 writeback via smem staging buffer** — warp results are
+   first written to a 128×64 byte `smem_packed` buffer in shared memory,
+   then all 256 threads perform coalesced `uint4` stores to global memory
+   (8 threads per 32-byte row). Eliminates the scattered 4-byte writes
+   that previously caused 8× sector amplification.
+
+2. **Coalesced SFC writeback via smem staging** — the 1-byte per-row SFC
+   (scale factor) writes are staged to a 128×4 byte `smem_sfc` buffer,
+   then written as a single `uint32` per row. Eliminates 16× sector
+   amplification from strided 1-byte stores.
+
+3. **smem_A stride padding (128 → 136)** — the col-major smem_A buffer is
+   padded from stride 128 to 136 elements. This shifts each column's bank
+   assignment, reducing the 8-way bank conflict on the WMMA
+   `load_matrix_sync` to 2-way. Stride 136 is a multiple of 8, preserving
+   `uint4` store alignment.
+
+4. **Register-based byte extraction** — the partial-tail write path
+   extracts bytes from `uint4` via register shifts instead of
+   `reinterpret_cast` indexing, eliminating local memory spilling.
 
 ## Files
 
 - `rht_gemm_sm120.cuh` — Main kernel header (drop-in replacement)
 - `sr.sm120.cuh` — Symlink to `../stochastic_rounding/sr.sm120.cuh` (FP4 SR polyfill)
 - `test_correctness.cu` — Correctness test vs naive CPU reference + benchmark
+- `bench_rht_only.cu` — Standalone RHT benchmark for ncu/nsys profiling
+- `bench_dram.cu` — DRAM bandwidth benchmark (rotates A buffers to defeat L2)
 - `test_compare.cu` — Main driver for SM100 comparison test
 - `test_compare_ours.cu` — Our kernel instantiation (separate TU)
 - `test_compare_ref.cu` — TE reference kernel instantiation (separate TU)

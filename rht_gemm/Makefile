@@ -12,6 +12,14 @@ all: test_correctness.exe
 test_correctness.exe: test_correctness.cu rht_gemm_sm120.cuh
 	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
+# Standalone benchmarks for ncu/nsys profiling
+bench_rht_only.exe: bench_rht_only.cu rht_gemm_sm120.cuh
+	$(NVCC) $(NVCC_FLAGS) $< -o $@
+
+# DRAM bandwidth benchmark (rotates A buffers to defeat L2 caching)
+bench_dram.exe: bench_dram.cu rht_gemm_sm120.cuh
+	$(NVCC) $(NVCC_FLAGS) $< -o $@
+
 # SM100 comparison test: our kernel vs TE reference, run on GB200.
 # Compiled as 3 TUs to avoid include conflicts between sr.sm120.cuh and TE ptx.cuh.
 # All TE headers are vendored under te_ref/stubs/ — no external TE tree needed.

@@ -170,10 +170,19 @@ rht_gemm_kernel(
     const int block_col_base = blockIdx.y * TILE_N_BLOCK;
 
     // --- Shared memory layout ---
+    // smem_A:   TILE_N*136 BF16 (16*136*2 = 4352 B, padded stride 136)
+    // smem_B:   TILE_N*TILE_N BF16  (16*16*2   = 512 B)
+    // smem_result: WARPS*16*16 F32 (8*256*4   = 8192 B)
+    // smem_packed: TILE_M*TILE_N_BLOCK/2 bytes of packed FP4 (128*64/2 = 4096 B)
+    //            row-major, written coalesced by all threads at end of block.
+    // smem_sfc: TILE_M*GROUPS_PER_BLOCK bytes (128*4 = 512 B) staging SFC.
     extern __shared__ char smem_raw[];
     __nv_bfloat16* smem_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* smem_B = smem_A + TILE_M * TILE_N;
+    __nv_bfloat16* smem_B = smem_A + 16 * 136;
     float* smem_result = reinterpret_cast<float*>(smem_B + TILE_N * TILE_N);
+    uint8_t* smem_packed = reinterpret_cast<uint8_t*>(
+        smem_result + WARPS_PER_BLOCK * 16 * 16);
+    uint8_t* smem_sfc = smem_packed + TILE_M * TILE_N_BLOCK / 2;
 
     // --- Load B (16x16, row-major) once ---
     for (int i = threadIdx.x; i < TILE_N * TILE_N; i += THREADS_PER_BLOCK) {
@@ -199,7 +208,12 @@ rht_gemm_kernel(
         if (col_start >= N) break;
         const int col_group_idx = col_start / TILE_N;
 
-        // Load A tile (128x16, col-major) into shared memory
+        // Load A tile (128x16, col-major) into shared memory.
+        // Use padded stride 136 to reduce the 8-way bank conflict on the
+        // subsequent WMMA load to 2-way: column c starts at byte c*272,
+        // bank (c*68)%32 = (c*4)%32 → 8 distinct banks (2-way conflict).
+        // 136 is a multiple of 8 so uint4 stores stay aligned.
+        constexpr int SMEM_A_STRIDE = 136;
         {
             constexpr int ELEMS_PER_THREAD = 8;
             constexpr int THREADS_PER_COL = TILE_M / ELEMS_PER_THREAD;
@@ -209,7 +223,7 @@ rht_gemm_kernel(
             if (col < TILE_N) {
                 const __nv_bfloat16* src = A + (block_row + row_base)
                                          + (long long)M * (col_start + col);
-                __nv_bfloat16* dst = smem_A + col * TILE_M + row_base;
+                __nv_bfloat16* dst = smem_A + col * SMEM_A_STRIDE + row_base;
                 *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
             }
         }
@@ -219,7 +233,7 @@ rht_gemm_kernel(
         fragment<matrix_a, 16, 16, 16, __nv_bfloat16, col_major> a_frag;
         fragment<accumulator, 16, 16, 16, float> c_frag;
 
-        load_matrix_sync(a_frag, smem_A + warp_row_start, TILE_M);
+        load_matrix_sync(a_frag, smem_A + warp_row_start, SMEM_A_STRIDE);
         fill_fragment(c_frag, 0.0f);
         mma_sync(c_frag, a_frag, b_frag, c_frag);
 
@@ -303,14 +317,82 @@ rht_gemm_kernel(
             uint32_t packed = static_cast<uint32_t>(packed_lo)
                             | (static_cast<uint32_t>(packed_hi) << 16);
 
-            int byte_offset = (global_row * N + col_start + half * 8) / 2;
-            *reinterpret_cast<uint32_t*>(C + byte_offset) = packed;
+            // Write packed FP4 into smem staging buffer (row-major over the
+            // full 128x64 tile). Two half-threads of the same row write the
+            // low / high 4 bytes of that row's 8-byte segment for this group.
+            // smem_packed layout: [row][group][half] each 4 bytes.
+            int smem_row = warp_row_start + row_in_tile;
+            int smem_off = (smem_row * TILE_N_BLOCK + g * TILE_N + half * 8) / 2;
+            *reinterpret_cast<uint32_t*>(smem_packed + smem_off) = packed;
 
             if (half == 0) {
-                SFC[global_row * (N / TILE_N) + col_group_idx] = pvscale_fp8;
+                smem_sfc[smem_row * GROUPS_PER_BLOCK + g] = pvscale_fp8;
             }
         }
         __syncthreads();  // Before next group overwrites smem_A
+    }
+
+    // --- Coalesced writeback of the full 128xTILE_N_BLOCK FP4 tile ---
+    // 128 rows * (TILE_N_BLOCK/2) bytes/row = 4096 B. 256 threads * 16 B.
+    // thread t handles 16 contiguous bytes = one uint4 store.
+    //   8 consecutive threads cover one 32-byte row (coalesced).
+    {
+        const int bytes_per_row = TILE_N_BLOCK / 2;  // 32
+        const int tid = threadIdx.x;
+        const int byte_idx = tid * 16;
+        const int row = byte_idx / bytes_per_row;
+        const int col_byte = byte_idx % bytes_per_row;
+        const int global_row = block_row + row;
+        const int row_bytes_valid = (min(block_col_base + TILE_N_BLOCK, N) - block_col_base) / 2;
+
+        if (global_row < M && col_byte + 16 <= row_bytes_valid) {
+            uint4 v = *reinterpret_cast<const uint4*>(smem_packed + byte_idx);
+            int global_byte = (global_row * N + block_col_base) / 2 + col_byte;
+            *reinterpret_cast<uint4*>(C + global_byte) = v;
+        } else if (global_row < M && col_byte < row_bytes_valid) {
+            uint4 v = *reinterpret_cast<const uint4*>(smem_packed + byte_idx);
+            int global_byte = (global_row * N + block_col_base) / 2 + col_byte;
+            unsigned char bytes[16];
+            bytes[0]  = v.x & 0xFF; bytes[1]  = (v.x >> 8) & 0xFF;
+            bytes[2]  = (v.x >> 16) & 0xFF; bytes[3]  = (v.x >> 24) & 0xFF;
+            bytes[4]  = v.y & 0xFF; bytes[5]  = (v.y >> 8) & 0xFF;
+            bytes[6]  = (v.y >> 16) & 0xFF; bytes[7]  = (v.y >> 24) & 0xFF;
+            bytes[8]  = v.z & 0xFF; bytes[9]  = (v.z >> 8) & 0xFF;
+            bytes[10] = (v.z >> 16) & 0xFF; bytes[11] = (v.z >> 24) & 0xFF;
+            bytes[12] = v.w & 0xFF; bytes[13] = (v.w >> 8) & 0xFF;
+            bytes[14] = (v.w >> 16) & 0xFF; bytes[15] = (v.w >> 24) & 0xFF;
+            int valid = row_bytes_valid - col_byte;
+            for (int b = 0; b < valid; b++)
+                C[global_byte + b] = bytes[b];
+        }
+    }
+
+    // --- Coalesced writeback of SFC tile (128 rows x GROUPS_PER_BLOCK cols) ---
+    // smem_sfc is row-major with stride GROUPS_PER_BLOCK. Global SFC layout
+    // is [M][N/TILE_N] row-major. The block's tile starts at
+    // (block_row, block_col_base/TILE_N). GROUPS_PER_BLOCK consecutive
+    // columns => one uint32 store per row (when GROUPS_PER_BLOCK==4).
+    if (GROUPS_PER_BLOCK == 4) {
+        const int tid = threadIdx.x;
+        const int row = tid;
+        const int global_row = block_row + row;
+        if (row < TILE_M && global_row < M) {
+            uint32_t v = *reinterpret_cast<const uint32_t*>(
+                smem_sfc + row * GROUPS_PER_BLOCK);
+            uint8_t* dst = SFC + global_row * (N / TILE_N)
+                         + block_col_base / TILE_N;
+            *reinterpret_cast<uint32_t*>(dst) = v;
+        }
+    } else {
+        const int tid = threadIdx.x;
+        const int idx = tid;
+        const int row = idx / GROUPS_PER_BLOCK;
+        const int col = idx % GROUPS_PER_BLOCK;
+        const int global_row = block_row + row;
+        if (row < TILE_M && global_row < M) {
+            SFC[global_row * (N / TILE_N) + block_col_base / TILE_N + col]
+                = smem_sfc[row * GROUPS_PER_BLOCK + col];
+        }
     }
 }
 
@@ -341,9 +423,11 @@ void rht_gemm_ntt_w_sfc(
     dim3 grid(m / TILE_M, (n + TILE_N_BLOCK - 1) / TILE_N_BLOCK);
     dim3 block(THREADS_PER_BLOCK);
 
-    int smem_size = TILE_M * TILE_N * sizeof(__nv_bfloat16)
+    int smem_size = 16 * 136 * sizeof(__nv_bfloat16)
                   + TILE_N * TILE_N * sizeof(__nv_bfloat16)
-                  + TILE_M * TILE_N * sizeof(float);
+                  + WARPS_PER_BLOCK * 16 * 16 * sizeof(float)
+                  + TILE_M * TILE_N_BLOCK / 2   // smem_packed
+                  + TILE_M * GROUPS_PER_BLOCK;  // smem_sfc
 
     auto kernel = &rht_gemm_kernel<kEnableStochasticRounding, kUseFastMath>;
 
